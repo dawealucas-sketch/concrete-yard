@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Concrete Yard — browser FPS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --concrete: #c9c4b8;
+      --shadow: #2b2e33;
+      --hazard: #e8a33d;
+      --hurt: #c8463c;
+      --ink: #f2efe8;
+      --font: 'Chakra Petch', 'Segoe UI', system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: var(--shadow); font-family: var(--font); color: var(--ink); }
+    canvas { display: block; }
+
+    /* Start screen */
+    #start {
+      position: fixed; inset: 0; display: grid; place-items: center;
+      background: rgba(43, 46, 51, 0.88); z-index: 10;
+    }
+    #start .panel { width: min(420px, 90vw); }
+    #start h1 { font-size: 44px; line-height: 1; margin: 0 0 8px; letter-spacing: 0.02em; }
+    #start p { margin: 0 0 24px; color: var(--concrete); line-height: 1.5; }
+    #start label { display: block; font-size: 14px; margin-bottom: 6px; color: var(--concrete); }
+    #start input {
+      width: 100%; padding: 12px; font: inherit; font-size: 18px;
+      background: var(--ink); color: var(--shadow); border: 0; border-left: 6px solid var(--hazard);
+    }
+    #start button {
+      margin-top: 16px; width: 100%; padding: 14px; font: inherit; font-size: 18px; font-weight: 700;
+      background: var(--hazard); color: var(--shadow); border: 0; cursor: pointer;
+    }
+    #start button:focus-visible, #start input:focus-visible { outline: 3px solid var(--ink); outline-offset: 2px; }
+    #start .keys { margin-top: 20px; font-size: 14px; color: var(--concrete); line-height: 1.7; }
+    #start .error { color: var(--hurt); min-height: 1.4em; margin-top: 10px; }
+
+    /* In-game HUD */
+    #hud { position: fixed; inset: 0; pointer-events: none; }
+    #crosshair {
+      position: absolute; left: 50%; top: 50%; width: 18px; height: 18px; transform: translate(-50%, -50%);
+    }
+    #crosshair::before, #crosshair::after {
+      content: ''; position: absolute; background: var(--ink); box-shadow: 0 0 2px #000;
+    }
+    #crosshair::before { left: 8px; top: 0; width: 2px; height: 18px; }
+    #crosshair::after { top: 8px; left: 0; height: 2px; width: 18px; }
+    #crosshair.hit::before, #crosshair.hit::after { background: var(--hazard); }
+    #crosshair.head::before, #crosshair.head::after { background: var(--hurt); }
+
+    /* Your own health: four segments, one per body hit */
+    #health { position: absolute; left: 24px; bottom: 24px; width: min(360px, 60vw); }
+    #health .number { font-size: 48px; font-weight: 700; line-height: 1; text-shadow: 0 1px 3px #000; }
+    #health .number small { font-size: 20px; font-weight: 500; margin-left: 4px; color: var(--concrete); }
+    #health .bar {
+      position: relative; height: 18px; margin-top: 8px;
+      background: rgba(0,0,0,0.5); border: 2px solid rgba(242,239,232,0.6);
+    }
+    #health .trail, #health .fill { position: absolute; left: 0; top: 0; bottom: 0; width: 100%; }
+    #health .trail { background: rgba(242,239,232,0.45); transition: width 0.5s 0.3s; }
+    #health .fill { background: var(--ink); transition: width 0.12s, background 0.2s; }
+    #health .ticks {
+      position: absolute; inset: 0;
+      background: linear-gradient(90deg, transparent calc(25% - 1px), var(--shadow) calc(25% - 1px) 25%, transparent 25%,
+        transparent calc(50% - 1px), var(--shadow) calc(50% - 1px) 50%, transparent 50%,
+        transparent calc(75% - 1px), var(--shadow) calc(75% - 1px) 75%, transparent 75%);
+    }
+    #health.mid .fill { background: var(--hazard); }
+    #health.low .fill { background: var(--hurt); }
+    #health.low .number { color: var(--hurt); }
+
+    #feed { position: absolute; right: 20px; top: 20px; text-align: right; font-size: 15px; }
+    #feed div { background: rgba(43,46,51,0.7); padding: 4px 10px; margin-bottom: 4px; }
+
+    #scoreboard {
+      position: absolute; left: 50%; top: 12%; transform: translateX(-50%);
+      width: min(480px, 92vw); background: rgba(43,46,51,0.92); padding: 16px 20px; display: none;
+    }
+    #scoreboard.show { display: block; }
+    #scoreboard table { width: 100%; border-collapse: collapse; font-size: 16px; }
+    #scoreboard th { text-align: left; color: var(--concrete); font-weight: 500; padding-bottom: 8px; }
+    #scoreboard td { padding: 4px 0; }
+    #scoreboard th:not(:first-child), #scoreboard td:not(:first-child) { text-align: right; width: 70px; }
+    #scoreboard tr.me td { color: var(--hazard); }
+
+    #dead {
+      position: absolute; inset: 0; display: none; place-items: center;
+      background: rgba(200, 70, 60, 0.25); font-size: 28px; text-shadow: 0 1px 4px #000;
+    }
+    #dead.show { display: grid; }
+    #damage { position: absolute; inset: 0; box-shadow: inset 0 0 120px var(--hurt); opacity: 0; transition: opacity 0.3s; }
+
+    #paused {
+      position: absolute; left: 50%; top: 62%; transform: translateX(-50%);
+      background: rgba(43,46,51,0.85); padding: 10px 18px; font-size: 16px; display: none;
+    }
+    #paused.show { display: block; }
+  </style>
+</head>
+<body>
+  <div id="start">
+    <form class="panel" id="joinForm">
+      <h1>Concrete Yard</h1>
+      <p>A small arena shooter. Up to 20 players share one match.</p>
+      <label for="name">Your name</label>
+      <input id="name" maxlength="16" autocomplete="off" placeholder="Player" />
+      <button type="submit">Join match</button>
+      <div class="error" id="error"></div>
+      <div class="keys">
+        Move with W A S D, jump with Space.<br />
+        Aim with the mouse, hold left click to fire.<br />
+        Hold Tab for scores, press Esc to release the mouse.
+      </div>
+    </form>
+  </div>
+
+  <div id="hud">
+    <div id="crosshair"></div>
+    <div id="health">
+      <div class="number"><span class="value">100</span><small>health</small></div>
+      <div class="bar"><div class="trail"></div><div class="fill"></div><div class="ticks"></div></div>
+    </div>
+    <div id="feed"></div>
+    <div id="scoreboard">
+      <table>
+        <thead><tr><th>Player</th><th>Kills</th><th>Deaths</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div id="damage"></div>
+    <div id="dead"><div id="deadText">Eliminated</div></div>
+    <div id="paused">Click to resume</div>
+  </div>
+
+  <!-- Socket.IO client is served automatically by the server -->
+  <script src="/socket.io/socket.io.js"></script>
+  <script type="module" src="/game.js"></script>
+</body>
+</html>
