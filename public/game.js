@@ -7,7 +7,7 @@
 //   4. Shows what the server reports: other players, shots, health, scores.
 
 import * as THREE from '/three/three.module.js';
-import { WALLS, ARENA_SIZE, EYE_HEIGHT, PLAYER_RADIUS } from './map.js';
+import { SHAPES, ARENA_SIZE, EYE_HEIGHT, BODY_HEIGHT, blockedAt, groundAt, ceilingAt } from './map.js';
 import { KITS, DEFAULT_KIT } from './kits.js';
 
 // ---- Movement settings (speed, jumps and fire rate come from the kit) ----
@@ -40,7 +40,7 @@ document.body.prepend(renderer.domElement);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x9fb4c4);
-scene.fog = new THREE.Fog(0x9fb4c4, 30, 90);
+scene.fog = new THREE.Fog(0x9fb4c4, 45, 130);
 
 const camera = new THREE.PerspectiveCamera(NORMAL_FOV, window.innerWidth / window.innerHeight, 0.05, 200);
 camera.rotation.order = 'YXZ'; // yaw first, then pitch — standard for FPS cameras
@@ -51,7 +51,8 @@ const sun = new THREE.DirectionalLight(0xffffff, 1.6);
 sun.position.set(20, 40, 15);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
-Object.assign(sun.shadow.camera, { left: -35, right: 35, top: 35, bottom: -35 });
+sun.shadow.camera.far = 150;
+Object.assign(sun.shadow.camera, { left: -48, right: 48, top: 48, bottom: -48 });
 scene.add(sun);
 
 // Floor
@@ -62,20 +63,64 @@ const floor = new THREE.Mesh(
 floor.rotation.x = -Math.PI / 2;
 floor.receiveShadow = true;
 scene.add(floor);
-const grid = new THREE.GridHelper(ARENA_SIZE, 30, 0x6f6a60, 0x6f6a60);
+const grid = new THREE.GridHelper(ARENA_SIZE, 42, 0x6f6a60, 0x6f6a60);
 grid.position.y = 0.01;
 scene.add(grid);
 
-// Walls from the shared map
-const wallMaterial = new THREE.MeshStandardMaterial({ color: 0xc9c4b8, roughness: 0.9 });
-const lowMaterial = new THREE.MeshStandardMaterial({ color: 0xe8a33d, roughness: 0.7 });
-for (const w of WALLS) {
-  const mesh = new THREE.Mesh(new THREE.BoxGeometry(w.w, w.h, w.d), w.h < 2 ? lowMaterial : wallMaterial);
-  mesh.position.set(w.x, w.h / 2, w.z);
-  mesh.castShadow = true;
-  mesh.receiveShadow = true;
-  scene.add(mesh);
+// ---- Map shapes from the shared map ----
+const materials = {
+  wall:  new THREE.MeshStandardMaterial({ color: 0xc9c4b8, roughness: 0.9 }),
+  crate: new THREE.MeshStandardMaterial({ color: 0xe8a33d, roughness: 0.7, flatShading: true }),
+  metal: new THREE.MeshStandardMaterial({ color: 0x5b6470, roughness: 0.5, metalness: 0.3, flatShading: true }),
+  tank:  new THREE.MeshStandardMaterial({ color: 0x6f8f8a, roughness: 0.6, metalness: 0.2 }),
+  ramp:  new THREE.MeshStandardMaterial({ color: 0xb9a37a, roughness: 0.85, flatShading: true }),
+  pad:   new THREE.MeshStandardMaterial({ color: 0x3fd0c9, emissive: 0x3fd0c9, emissiveIntensity: 0.6, roughness: 0.4 }),
+};
+
+// A wedge: rises from 0 at one end to h at the other
+function rampGeometry(s) {
+  const hw = s.w / 2, hd = s.d / 2;
+  const corners = [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]]; // A, B, C, D
+  const heightAt = ([x, z]) => {
+    const t = s.dir === '+x' ? (x + hw) / s.w : s.dir === '-x' ? (hw - x) / s.w
+            : s.dir === '+z' ? (z + hd) / s.d : (hd - z) / s.d;
+    return s.h * t;
+  };
+  const bottom = corners.map(([x, z]) => [x, 0, z]);
+  const top = corners.map((c) => [c[0], heightAt(c), c[1]]);
+  const [A, B, C, D] = [0, 1, 2, 3];
+  const tris = [
+    [top[A], top[D], top[C]], [top[A], top[C], top[B]],                // sloped top
+    [bottom[A], bottom[C], bottom[D]], [bottom[A], bottom[B], bottom[C]], // underside
+  ];
+  for (const [p, q] of [[A, B], [B, C], [C, D], [D, A]]) {             // four sides
+    tris.push([bottom[p], top[p], top[q]], [bottom[p], top[q], bottom[q]]);
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(tris.flat(2), 3));
+  geometry.computeVertexNormals();
+  return geometry;
 }
+
+function shapeMesh(s) {
+  let geometry;
+  switch (s.type) {
+    case 'box':   geometry = new THREE.BoxGeometry(s.w, s.h, s.d); break;
+    case 'cyl':   geometry = new THREE.CylinderGeometry(s.r, s.r, s.h, 32); break;
+    case 'prism': geometry = new THREE.CylinderGeometry(s.r, s.r, s.h, s.sides); break;
+    case 'pad':   geometry = new THREE.CylinderGeometry(s.r, s.r * 1.1, s.h, 32); break;
+    case 'ramp':  geometry = rampGeometry(s); break;
+  }
+  const mesh = new THREE.Mesh(geometry, materials[s.style] || materials.wall);
+  // Ramps are built from their base; everything else is centred
+  mesh.position.set(s.x, s.type === 'ramp' ? s.y : s.y + s.h / 2, s.z);
+  if (s.type === 'prism') mesh.rotation.y = s.rot;
+  mesh.castShadow = s.type !== 'pad';
+  mesh.receiveShadow = true;
+  return mesh;
+}
+
+for (const s of SHAPES) scene.add(shapeMesh(s));
 
 // A simple gun model attached to the camera
 const gun = new THREE.Mesh(
@@ -491,30 +536,7 @@ function fire() {
   setTimeout(() => (gun.position.z = -0.45), 60);
 }
 
-// ---- Collision with walls ----
-// Highest wall top under the player's feet (0 if standing on the floor).
-function groundHeightAt(x, z, feetY) {
-  let ground = 0;
-  for (const w of WALLS) {
-    const inside =
-      Math.abs(x - w.x) < w.w / 2 + PLAYER_RADIUS * 0.5 &&
-      Math.abs(z - w.z) < w.d / 2 + PLAYER_RADIUS * 0.5;
-    if (inside && feetY >= w.h - 0.1) ground = Math.max(ground, w.h);
-  }
-  return ground;
-}
-
-// True if a player standing at (x, z) with feet at feetY overlaps a wall.
-function blocked(x, z, feetY) {
-  for (const w of WALLS) {
-    if (feetY >= w.h - 0.05) continue; // we're above this wall
-    if (
-      Math.abs(x - w.x) < w.w / 2 + PLAYER_RADIUS &&
-      Math.abs(z - w.z) < w.d / 2 + PLAYER_RADIUS
-    ) return true;
-  }
-  return false;
-}
+// Collision helpers (blockedAt, groundAt, ceilingAt) live in map.js
 
 function updateMovement(dt) {
   if (!me.alive) return;
@@ -533,22 +555,47 @@ function updateMovement(dt) {
     mz = (mz / len) * speed * dt;
   }
 
-  // Move one axis at a time so we slide along walls instead of sticking
-  const feet = me.pos.y - EYE_HEIGHT;
-  if (!blocked(me.pos.x + mx, me.pos.z, feet)) me.pos.x += mx;
-  if (!blocked(me.pos.x, me.pos.z + mz, feet)) me.pos.z += mz;
+  // Move one axis at a time so we slide along walls instead of sticking.
+  // Anything lower than a step (stairs, the slope of a ramp) is walked straight onto.
+  const oldFeet = me.pos.y - EYE_HEIGHT;
+  if (!blockedAt(me.pos.x + mx, me.pos.z, oldFeet)) me.pos.x += mx;
+  if (!blockedAt(me.pos.x, me.pos.z + mz, oldFeet)) me.pos.z += mz;
 
   // Gravity (jumping is handled in the keydown listener)
   me.velY -= GRAVITY * dt;
   me.pos.y += me.velY * dt;
+  let feet = me.pos.y - EYE_HEIGHT;
 
-  const ground = groundHeightAt(me.pos.x, me.pos.z, me.pos.y - EYE_HEIGHT) + EYE_HEIGHT;
-  if (me.pos.y <= ground) {
-    me.pos.y = ground;
-    me.velY = 0;
-    me.onGround = true;
-    me.jumpsLeft = KITS[me.kit].jumps;
-  } else if (me.onGround) {
+  // Bump your head on bridges and roofs
+  if (me.velY > 0) {
+    const ceiling = ceilingAt(me.pos.x, me.pos.z, oldFeet, feet);
+    if (ceiling !== null) {
+      feet = ceiling - BODY_HEIGHT;
+      me.pos.y = feet + EYE_HEIGHT;
+      me.velY = 0;
+    }
+  }
+
+  // Land on whatever is underneath (only while not rising, so jumps aren't cut short)
+  if (me.velY <= 0) {
+    const { ground, pad } = groundAt(me.pos.x, me.pos.z, Math.max(oldFeet, feet));
+    // While walking, stick to the ground when going down ramps and small drops
+    const followSlope = me.onGround && feet - ground < 0.35;
+    if (feet <= ground || followSlope) {
+      me.pos.y = ground + EYE_HEIGHT;
+      me.velY = 0;
+      me.onGround = true;
+      me.jumpsLeft = KITS[me.kit].jumps;
+
+      if (pad) { // jump pad: launch upward, keeping any air jumps the kit has
+        me.velY = pad.power;
+        me.onGround = false;
+        me.jumpsLeft = Math.max(0, KITS[me.kit].jumps - 1);
+      }
+      return;
+    }
+  }
+  if (me.onGround) {
     me.onGround = false;
     me.jumpsLeft = Math.max(0, KITS[me.kit].jumps - 1);
   }
@@ -566,6 +613,7 @@ function frame() {
 
   camera.position.copy(me.pos);
   camera.rotation.set(me.pitch, me.yaw, 0);
+  materials.pad.emissiveIntensity = 0.45 + 0.35 * Math.sin(performance.now() / 250);
   gun.visible = me.alive && !zoomed;
 
   // Smoothly move other players toward their latest known position
