@@ -117,6 +117,53 @@
     #paused { position: absolute; left: 50%; top: 62%; transform: translateX(-50%);
       background: rgba(43,46,51,0.85); padding: 10px 18px; font-size: 16px; display: none; }
     #paused.show { display: block; }
+
+    /* Map name and round timer at the top of the screen */
+    #roundInfo {
+      position: absolute; left: 50%; top: 14px; transform: translateX(-50%);
+      background: rgba(43,46,51,0.75); padding: 6px 14px; font-size: 16px;
+      display: flex; gap: 12px; align-items: baseline; white-space: nowrap;
+    }
+    #roundInfo .time { font-weight: 700; font-variant-numeric: tabular-nums; }
+    #roundInfo .time.ending { color: var(--hazard); }
+
+    .now-playing { color: var(--ink) !important; }
+    .now-playing strong { color: var(--hazard); }
+
+    /* Results and map vote between rounds */
+    #intermission .panel { width: min(1100px, 100%); }
+    #intermission h3 { font-size: 18px; margin: 0 0 10px; color: var(--concrete); font-weight: 500; }
+    .inter-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: 28px; }
+    @media (max-width: 760px) { .inter-grid { grid-template-columns: 1fr; } }
+    #resultsTable { width: 100%; border-collapse: collapse; font-size: 16px; }
+    #resultsTable th { text-align: left; color: var(--concrete); font-weight: 500; padding: 0 0 6px; }
+    #resultsTable td { padding: 5px 0; border-top: 1px solid rgba(242,239,232,0.1); }
+    #resultsTable th:nth-child(n+4), #resultsTable td:nth-child(n+4) { text-align: right; width: 64px; }
+    #resultsTable td:first-child { width: 36px; font-weight: 700; }
+    #resultsTable td:nth-child(3) { color: var(--concrete); }
+    #resultsTable tr.first td { color: var(--hazard); font-weight: 700; }
+    #resultsTable tr.me td:nth-child(2)::after { content: '  (you)'; color: var(--concrete); font-weight: 500; }
+    .vote-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    @media (max-width: 480px) { .vote-options { grid-template-columns: 1fr; } }
+    .vote {
+      text-align: left; cursor: pointer; color: var(--ink); padding: 0; overflow: hidden;
+      background: rgba(242,239,232,0.06); border: 2px solid rgba(242,239,232,0.15);
+      display: flex; flex-direction: column;
+    }
+    .vote:hover { background: rgba(242,239,232,0.12); }
+    .vote[aria-pressed="true"] { border-color: var(--hazard); background: rgba(232,163,61,0.14); }
+    .vote .swatch { display: flex; height: 26px; }
+    .vote .swatch span { flex: 1; }
+    .vote .body { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 4px; }
+    .vote .top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+    .vote .map-name { font-size: 19px; font-weight: 700; }
+    .vote .key { font-size: 13px; color: var(--concrete); }
+    .vote .tag { font-size: 13px; color: var(--hazard); }
+    .vote .blurb { font-size: 14px; color: var(--concrete); line-height: 1.35; }
+    .vote .bar { height: 6px; background: rgba(0,0,0,0.4); margin-top: 6px; }
+    .vote .bar div { height: 100%; width: 0; background: var(--hazard); transition: width 0.2s; }
+    .vote .count { font-size: 13px; color: var(--concrete); }
+    .hint { font-size: 14px; margin-top: 10px !important; }
   </style>
 </head>
 <body>
@@ -125,6 +172,7 @@
     <form class="panel" id="joinForm">
       <h1>Concrete Yard</h1>
       <p>A small arena shooter. Up to 20 players share one match.</p>
+      <p class="now-playing" id="nowPlaying"></p>
       <label class="field-label" for="name">Your name</label>
       <input id="name" maxlength="16" autocomplete="off" placeholder="Player" />
       <span class="field-label">Choose a kit</span>
@@ -134,9 +182,32 @@
       <div class="keys">
         Move with W A S D, jump with Space.<br />
         Aim with the mouse, hold left click to fire. Sniper zooms with right click.<br />
-        Hold Tab for scores, press Esc to release the mouse.
+        Hold Tab for scores, press Esc to release the mouse.<br />
+        Every 15 minutes the round ends and everyone votes on the next map.
       </div>
     </form>
+  </div>
+
+  <!-- Results and map vote between rounds -->
+  <div id="intermission" class="screen">
+    <div class="panel">
+      <h2 id="roundTitle">Round over</h2>
+      <p id="roundSub">Next map in 25</p>
+      <div class="inter-grid">
+        <section>
+          <h3>Results</h3>
+          <table id="resultsTable">
+            <thead><tr><th>#</th><th>Player</th><th>Kit</th><th>Kills</th><th>Deaths</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </section>
+        <section>
+          <h3>Vote for the next map</h3>
+          <div class="vote-options" id="voteOptions"></div>
+          <p class="hint">Click a map or press 1 to 4. You can change your vote until the timer ends.</p>
+        </section>
+      </div>
+    </div>
   </div>
 
   <!-- Death screen -->
@@ -171,6 +242,7 @@
       <div class="number"><span class="value">100</span><small class="kit-label">Tank</small></div>
       <div class="bar"><div class="trail"></div><div class="fill"></div><div class="ticks"></div></div>
     </div>
+    <div id="roundInfo"><span class="map">—</span><span class="time">15:00</span></div>
     <div id="feed"></div>
     <div id="scoreboard">
       <table>
