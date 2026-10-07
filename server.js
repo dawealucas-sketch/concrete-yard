@@ -5,13 +5,14 @@
 //   2. Keeps the list of players: kit, health, kills and deaths.
 //   3. Decides whether shots hit (so players can't simply claim a kill).
 //   4. Sends everyone's positions to everyone else 20 times per second.
+//   5. Runs rounds: play one map, show results, vote on 4 random maps, repeat.
 
 import express from 'express';
 import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Server } from 'socket.io';
-import { SPAWN_POINTS, ARENA_SIZE, EYE_HEIGHT, raycastMap } from './public/map.js';
+import { MAPS, EYE_HEIGHT, raycastMap, setActiveMap, getMap } from './public/map.js';
 import { KITS, DEFAULT_KIT } from './public/kits.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -21,9 +22,15 @@ const PORT = process.env.PORT || 3000;
 const MAX_PLAYERS = 20;
 const TICK_RATE = 20;          // position updates sent per second
 const RESPAWN_MS = 3000;       // minimum time on the death screen
-const SHOT_RANGE = 100;
+const SHOT_RANGE = 180;        // long enough to cross the biggest maps
 const MAX_SPEED = 12;          // units per second; faster movement is rejected
 const FIRE_TOLERANCE_MS = 30;  // allows for small network timing differences
+
+// ---- Round settings ----
+// To test rounds quickly, change ROUND_MINUTES to 1 (then change it back).
+const ROUND_MINUTES = Number(process.env.ROUND_MINUTES) || 15;
+const INTERMISSION_SECONDS = Number(process.env.INTERMISSION_SECONDS) || 25; // results and map vote
+const VOTE_CHOICES = 4;          // maps offered in each vote
 
 const app = express();
 const server = http.createServer(app);
@@ -36,9 +43,33 @@ app.use('/three', express.static(path.join(__dirname, 'node_modules/three/build'
 // All connected players, keyed by their socket id
 const players = {};
 
-function randomSpawn() {
-  const s = SPAWN_POINTS[Math.floor(Math.random() * SPAWN_POINTS.length)];
-  return { x: s.x, y: EYE_HEIGHT, z: s.z };
+// The current round
+const round = {
+  phase: 'playing',  // 'playing' or 'intermission'
+  mapId: MAPS[Math.floor(Math.random() * MAPS.length)].id,
+  endsAt: 0,
+  results: [],       // final ranking shown on the results screen
+  options: [],       // map ids offered in the vote
+};
+round.endsAt = Date.now() + ROUND_MINUTES * 60000;
+setActiveMap(round.mapId);
+
+function secondsLeft() {
+  return Math.max(0, Math.ceil((round.endsAt - Date.now()) / 1000));
+}
+
+// Spawn at the open point farthest from other living players
+function pickSpawn() {
+  const spawns = getMap(round.mapId).spawns;
+  const living = Object.values(players).filter((p) => p.alive);
+  let best = spawns[0], bestDist = -1;
+  for (const s of spawns) {
+    const nearest = living.length
+      ? Math.min(...living.map((p) => Math.hypot(p.x - s.x, p.z - s.z)))
+      : Math.random() * 100; // nobody around: pick any
+    if (nearest > bestDist) { bestDist = nearest; best = s; }
+  }
+  return { x: best.x, y: EYE_HEIGHT, z: best.z };
 }
 
 function cleanName(name) {
@@ -54,7 +85,7 @@ function validKit(kitId) {
 function spawnPlayer(p, kitId) {
   p.kit = validKit(kitId);
   const kit = KITS[p.kit];
-  Object.assign(p, randomSpawn(), {
+  Object.assign(p, pickSpawn(), {
     maxHealth: kit.maxHealth,
     health: kit.maxHealth,
     alive: true,
@@ -135,9 +166,80 @@ function applyHit(shooter, target, headshot) {
   }
 }
 
+// ---- Rounds ----
+
+function ranked() {
+  return Object.values(players).sort((a, b) => b.kills - a.kills || a.deaths - b.deaths || a.joinedAt - b.joinedAt);
+}
+
+function shuffled(list) {
+  const copy = [...list];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
+}
+
+function tallyVotes() {
+  const counts = Object.fromEntries(round.options.map((id) => [id, 0]));
+  for (const p of Object.values(players)) if (p.vote in counts) counts[p.vote] += 1;
+  return counts;
+}
+
+function intermissionInfo() {
+  return { results: round.results, options: round.options, votes: tallyVotes(), secondsLeft: secondsLeft() };
+}
+
+function endRound() {
+  const list = ranked();
+  const others = MAPS.filter((m) => m.id !== round.mapId).map((m) => m.id);
+  if (!list.length) { // nobody playing: switch quietly
+    startRound(others[Math.floor(Math.random() * others.length)]);
+    return;
+  }
+  round.phase = 'intermission';
+  round.endsAt = Date.now() + INTERMISSION_SECONDS * 1000;
+  round.results = list.map((p, i) => ({ rank: i + 1, id: p.id, name: p.name, kit: p.kit, kills: p.kills, deaths: p.deaths }));
+  round.options = shuffled(others).slice(0, VOTE_CHOICES);
+  for (const p of list) { p.alive = false; p.vote = null; }
+  io.emit('intermission', intermissionInfo());
+  const top = list[0];
+  io.emit('feed', top.kills > 0 ? `Round over. ${top.name} wins!` : 'Round over.');
+}
+
+function finishVote() {
+  const counts = tallyVotes();
+  const most = Math.max(...Object.values(counts));
+  const leaders = round.options.filter((id) => counts[id] === most);
+  startRound(leaders[Math.floor(Math.random() * leaders.length)]);
+}
+
+function startRound(mapId) {
+  round.phase = 'playing';
+  round.mapId = mapId;
+  round.endsAt = Date.now() + ROUND_MINUTES * 60000;
+  round.options = [];
+  setActiveMap(mapId);
+  io.emit('map', { mapId, phase: round.phase, secondsLeft: secondsLeft() });
+  for (const p of Object.values(players)) {
+    p.kills = 0;
+    p.deaths = 0;
+    p.vote = null;
+    p.alive = false; // so spawns spread out as each player is placed
+  }
+  for (const p of Object.values(players)) {
+    spawnPlayer(p, p.kit);
+    io.to(p.id).emit('spawned', { x: p.x, y: p.y, z: p.z, kit: p.kit, id: p.id });
+  }
+  io.emit('feed', `Now playing: ${getMap(mapId).name}`);
+}
+
 // ---- Connections ----
 
 io.on('connection', (socket) => {
+  socket.emit('map', { mapId: round.mapId, phase: round.phase, secondsLeft: secondsLeft() });
+
   socket.on('join', (data) => {
     if (players[socket.id]) return;
     if (Object.keys(players).length >= MAX_PLAYERS) {
@@ -152,20 +254,39 @@ io.on('connection', (socket) => {
       yaw: 0, pitch: 0,
       kills: 0, deaths: 0,
       lastShot: 0,
+      joinedAt: Date.now(),
+      vote: null,
     };
+    io.emit('feed', `${p.name} joined as ${KITS[validKit(data && data.kit)].name}`);
+
+    if (round.phase === 'intermission') {
+      // Joined between rounds: wait on the results screen, spawn when the next map starts
+      p.kit = validKit(data && data.kit);
+      Object.assign(p, { x: 0, y: EYE_HEIGHT, z: 0, alive: false, maxHealth: KITS[p.kit].maxHealth, health: 0 });
+      players[socket.id] = p;
+      socket.emit('waiting', { id: socket.id, kit: p.kit });
+      socket.emit('intermission', intermissionInfo());
+      return;
+    }
     spawnPlayer(p, data && data.kit);
     players[socket.id] = p;
-
     socket.emit('spawned', { x: p.x, y: p.y, z: p.z, kit: p.kit, id: socket.id });
-    io.emit('feed', `${p.name} joined as ${KITS[p.kit].name}`);
   });
 
   // From the death screen: "Continue" sends the same kit, "Change kit" sends a new one
   socket.on('respawn', (kitId) => {
     const p = players[socket.id];
-    if (!p || p.alive || Date.now() < p.canRespawnAt) return;
+    if (!p || p.alive || round.phase !== 'playing' || Date.now() < p.canRespawnAt) return;
     spawnPlayer(p, kitId);
     socket.emit('spawned', { x: p.x, y: p.y, z: p.z, kit: p.kit, id: socket.id });
+  });
+
+  // Vote for the next map between rounds
+  socket.on('vote', (mapId) => {
+    const p = players[socket.id];
+    if (!p || round.phase !== 'intermission' || !round.options.includes(mapId)) return;
+    p.vote = mapId;
+    io.emit('votes', tallyVotes());
   });
 
   // The browser reports where its player is. The server checks it is believable.
@@ -184,7 +305,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const limit = ARENA_SIZE / 2;
+    const limit = getMap(round.mapId).size / 2;
     p.x = Math.max(-limit, Math.min(limit, data.x));
     p.z = Math.max(-limit, Math.min(limit, data.z));
     p.y = Math.max(EYE_HEIGHT, Math.min(40, Number(data.y) || EYE_HEIGHT)); // jump pads go high
@@ -232,12 +353,18 @@ io.on('connection', (socket) => {
     if (!p) return;
     delete players[socket.id];
     io.emit('feed', `${p.name} left`);
+    if (round.phase === 'intermission') io.emit('votes', tallyVotes());
   });
 });
 
-// ---- Every tick: Medic healing, then send everyone the current state ----
+// ---- Every tick: round timer, Medic healing, then send everyone the current state ----
 setInterval(() => {
   const now = Date.now();
+  if (now >= round.endsAt) {
+    if (round.phase === 'playing') endRound();
+    else finishVote();
+  }
+
   for (const p of Object.values(players)) {
     const regen = KITS[p.kit].regen;
     if (regen && p.alive && p.health < p.maxHealth && now - p.lastDamaged >= regen.delayMs) {
@@ -245,13 +372,13 @@ setInterval(() => {
     }
   }
 
-  const state = Object.values(players).map((p) => ({
+  const list = Object.values(players).map((p) => ({
     id: p.id, name: p.name, kit: p.kit,
     x: p.x, y: p.y, z: p.z, yaw: p.yaw, pitch: p.pitch,
     health: Math.ceil(p.health), maxHealth: p.maxHealth,
     alive: p.alive, kills: p.kills, deaths: p.deaths,
   }));
-  io.emit('state', state);
+  io.emit('state', { players: list, phase: round.phase, mapId: round.mapId, secondsLeft: secondsLeft() });
 }, 1000 / TICK_RATE);
 
 server.listen(PORT, () => {
