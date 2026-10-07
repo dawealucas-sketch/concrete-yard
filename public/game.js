@@ -5,9 +5,10 @@
 //   2. Reads keyboard and mouse to move and aim your player.
 //   3. Tells the server where you are and when you fire.
 //   4. Shows what the server reports: other players, shots, health, scores.
+//   5. Draws whichever map the server is on, and the results and vote between rounds.
 
 import * as THREE from '/three/three.module.js';
-import { SHAPES, ARENA_SIZE, EYE_HEIGHT, BODY_HEIGHT, blockedAt, groundAt, ceilingAt } from './map.js';
+import { MAPS, EYE_HEIGHT, BODY_HEIGHT, blockedAt, groundAt, ceilingAt, raycastMap, setActiveMap, getMap } from './map.js';
 import { KITS, DEFAULT_KIT } from './kits.js';
 
 // ---- Movement settings (speed, jumps and fire rate come from the kit) ----
@@ -30,6 +31,8 @@ const feedBox = $('#feed');
 const scoreboard = $('#scoreboard');
 const pausedBox = $('#paused');
 const damageFlash = $('#damage');
+const intermissionScreen = $('#intermission');
+const roundInfo = $('#roundInfo');
 
 // ---- three.js scene ----
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -39,43 +42,22 @@ renderer.shadowMap.enabled = true;
 document.body.prepend(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x9fb4c4);
-scene.fog = new THREE.Fog(0x9fb4c4, 45, 130);
+scene.background = new THREE.Color(0x000000);
+scene.fog = new THREE.Fog(0x000000, 40, 120);
 
-const camera = new THREE.PerspectiveCamera(NORMAL_FOV, window.innerWidth / window.innerHeight, 0.05, 200);
+const camera = new THREE.PerspectiveCamera(NORMAL_FOV, window.innerWidth / window.innerHeight, 0.05, 300);
 camera.rotation.order = 'YXZ'; // yaw first, then pitch — standard for FPS cameras
 scene.add(camera);
 
-scene.add(new THREE.HemisphereLight(0xdfe8ef, 0x5a5348, 1.0));
+const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
+scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xffffff, 1.6);
-sun.position.set(20, 40, 15);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
-sun.shadow.camera.far = 150;
-Object.assign(sun.shadow.camera, { left: -48, right: 48, top: 48, bottom: -48 });
 scene.add(sun);
+scene.add(sun.target);
 
-// Floor
-const floor = new THREE.Mesh(
-  new THREE.PlaneGeometry(ARENA_SIZE, ARENA_SIZE),
-  new THREE.MeshStandardMaterial({ color: 0x8c877c, roughness: 0.95 })
-);
-floor.rotation.x = -Math.PI / 2;
-floor.receiveShadow = true;
-scene.add(floor);
-const grid = new THREE.GridHelper(ARENA_SIZE, 42, 0x6f6a60, 0x6f6a60);
-grid.position.y = 0.01;
-scene.add(grid);
-
-// ---- Map shapes from the shared map ----
-const materials = {
-  wall:  new THREE.MeshStandardMaterial({ color: 0xc9c4b8, roughness: 0.9 }),
-  crate: new THREE.MeshStandardMaterial({ color: 0xe8a33d, roughness: 0.7, flatShading: true }),
-  metal: new THREE.MeshStandardMaterial({ color: 0x5b6470, roughness: 0.5, metalness: 0.3, flatShading: true }),
-  tank:  new THREE.MeshStandardMaterial({ color: 0x6f8f8a, roughness: 0.6, metalness: 0.2 }),
-  ramp:  new THREE.MeshStandardMaterial({ color: 0xb9a37a, roughness: 0.85, flatShading: true }),
-  pad:   new THREE.MeshStandardMaterial({ color: 0x3fd0c9, emissive: 0x3fd0c9, emissiveIntensity: 0.6, roughness: 0.4 }),
-};
+// ---- Drawing maps ----
 
 // A wedge: rises from 0 at one end to h at the other
 function rampGeometry(s) {
@@ -102,25 +84,101 @@ function rampGeometry(s) {
   return geometry;
 }
 
-function shapeMesh(s) {
-  let geometry;
+function shapeGeometry(s) {
   switch (s.type) {
-    case 'box':   geometry = new THREE.BoxGeometry(s.w, s.h, s.d); break;
-    case 'cyl':   geometry = new THREE.CylinderGeometry(s.r, s.r, s.h, 32); break;
-    case 'prism': geometry = new THREE.CylinderGeometry(s.r, s.r, s.h, s.sides); break;
-    case 'pad':   geometry = new THREE.CylinderGeometry(s.r, s.r * 1.1, s.h, 32); break;
-    case 'ramp':  geometry = rampGeometry(s); break;
+    case 'box':   return new THREE.BoxGeometry(s.w, s.h, s.d);
+    case 'cyl':   return new THREE.CylinderGeometry(s.r, s.r, s.h, 32);
+    case 'pad':   return new THREE.CylinderGeometry(s.r, s.r * 1.1, s.h, 32);
+    case 'ramp':  return rampGeometry(s);
+    case 'prism': { // flat faces so triangles and hexagons have crisp sides
+      const geometry = new THREE.CylinderGeometry(s.r, s.r, s.h, s.sides).toNonIndexed();
+      geometry.computeVertexNormals();
+      return geometry;
+    }
   }
-  const mesh = new THREE.Mesh(geometry, materials[s.style] || materials.wall);
-  // Ramps are built from their base; everything else is centred
-  mesh.position.set(s.x, s.type === 'ramp' ? s.y : s.y + s.h / 2, s.z);
-  if (s.type === 'prism') mesh.rotation.y = s.rot;
-  mesh.castShadow = s.type !== 'pad';
-  mesh.receiveShadow = true;
-  return mesh;
 }
 
-for (const s of SHAPES) scene.add(shapeMesh(s));
+let mapGroup = null;
+let padMaterial = null;
+let currentMapId = null;
+
+function loadMap(mapId) {
+  if (mapId === currentMapId) return;
+  const map = setActiveMap(mapId);
+  currentMapId = map.id;
+  const t = map.theme;
+
+  // Remove the old map
+  if (mapGroup) {
+    scene.remove(mapGroup);
+    mapGroup.traverse((o) => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) o.material.dispose();
+    });
+  }
+  mapGroup = new THREE.Group();
+
+  // Sky, fog and lights
+  scene.background.setHex(t.sky);
+  scene.fog.color.setHex(t.sky);
+  scene.fog.near = t.fogNear;
+  scene.fog.far = t.fogFar;
+  hemi.color.setHex(t.hemi[0]);
+  hemi.groundColor.setHex(t.hemi[1]);
+  hemi.intensity = t.hemi[2];
+  sun.color.setHex(t.sun[0]);
+  sun.intensity = t.sun[1];
+  const half = map.size / 2 + 4;
+  sun.position.set(map.size * 0.3, 70, map.size * 0.2);
+  Object.assign(sun.shadow.camera, { left: -half, right: half, top: half, bottom: -half, near: 1, far: 220 });
+  sun.shadow.camera.updateProjectionMatrix();
+
+  // Floor and grid
+  const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(map.size, map.size),
+    new THREE.MeshStandardMaterial({ color: t.floor, roughness: 0.95 })
+  );
+  floor.rotation.x = -Math.PI / 2;
+  floor.receiveShadow = true;
+  const grid = new THREE.GridHelper(map.size, Math.round(map.size / 2), t.grid, t.grid);
+  grid.position.y = 0.01;
+  mapGroup.add(floor, grid);
+
+  // One material per style in the theme, plus outline lines around every shape
+  const materials = {};
+  for (const [style, v] of Object.entries(t.styles)) {
+    materials[style] = new THREE.MeshStandardMaterial({
+      color: v.color,
+      emissive: v.emissive ?? 0x000000,
+      emissiveIntensity: v.glow ?? 0,
+      roughness: 0.75,
+      metalness: style === 'metal' ? 0.25 : 0.05,
+    });
+  }
+  padMaterial = materials.pad;
+  const edgeMaterial = new THREE.LineBasicMaterial({ color: t.edges });
+
+  for (const s of map.shapes) {
+    const geometry = shapeGeometry(s);
+    const mesh = new THREE.Mesh(geometry, materials[s.style] || materials.wall);
+    // Ramps are built from their base; everything else is centred
+    mesh.position.set(s.x, s.type === 'ramp' ? s.y : s.y + s.h / 2, s.z);
+    if (s.type === 'prism') mesh.rotation.y = s.rot;
+    mesh.castShadow = s.type !== 'pad';
+    mesh.receiveShadow = true;
+    mesh.add(new THREE.LineSegments(new THREE.EdgesGeometry(geometry, 25), edgeMaterial));
+    mapGroup.add(mesh);
+  }
+  scene.add(mapGroup);
+
+  roundInfo.querySelector('.map').textContent = map.name;
+  $('#nowPlaying').innerHTML = '';
+  const label = document.createElement('strong');
+  label.textContent = map.name;
+  $('#nowPlaying').append('Now playing: ', label, ` (${map.tag.toLowerCase()})`);
+}
+
+loadMap(MAPS[0].id); // replaced as soon as the server says which map is on
 
 // A simple gun model attached to the camera
 const gun = new THREE.Mesh(
@@ -207,7 +265,8 @@ function drawHealthBar(bar, health, maxHealth) {
 
 function createOther(p) {
   const group = new THREE.Group();
-  const material = new THREE.MeshStandardMaterial({ color: colorFromId(p.id), roughness: 0.6 });
+  const color = colorFromId(p.id);
+  const material = new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.25, roughness: 0.6 });
 
   // Sizes line up with the server's hit spheres
   const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.4, 0.7, 4, 10), material);
@@ -347,6 +406,8 @@ socket.on('spawned', ({ id, x, y, z, kit }) => {
   startScreen.classList.remove('show');
   deathScreen.classList.remove('show');
   kitScreen.classList.remove('show');
+  intermissionScreen.classList.remove('show');
+  clearInterval(intermissionTimer);
   lockMouse();
 });
 
@@ -368,7 +429,9 @@ socket.on('disconnect', () => {
   if (joined) addFeed('Lost connection to the server. Refresh the page to rejoin.');
 });
 
-socket.on('state', (state) => {
+socket.on('state', ({ players: state, phase, mapId, secondsLeft }) => {
+  loadMap(mapId);
+  showRoundTime(phase, secondsLeft);
   const seen = new Set();
   for (const p of state) {
     seen.add(p.id);
@@ -457,6 +520,135 @@ $('#backButton').addEventListener('click', () => {
 $('#respawnButton').addEventListener('click', () => socket.emit('respawn', chosenKit));
 
 socket.on('correct', ({ x, y, z }) => me.pos.set(x, y, z));
+
+// ---- Rounds and map voting ----
+let voteOptions = [];
+let myVote = null;
+let intermissionTimer = null;
+
+function showRoundTime(phase, seconds) {
+  const time = roundInfo.querySelector('.time');
+  if (phase === 'intermission') {
+    time.textContent = 'Voting';
+    time.classList.remove('ending');
+    return;
+  }
+  const m = Math.floor(seconds / 60), s = seconds % 60;
+  time.textContent = `${m}:${String(s).padStart(2, '0')}`;
+  time.classList.toggle('ending', seconds <= 60);
+}
+
+socket.on('map', ({ mapId, phase, secondsLeft }) => {
+  loadMap(mapId);
+  showRoundTime(phase, secondsLeft);
+  if (phase === 'playing') {
+    intermissionScreen.classList.remove('show');
+    clearInterval(intermissionTimer);
+  }
+});
+
+// Joined between rounds: we wait on the results screen until the next map starts
+socket.on('waiting', ({ id, kit }) => {
+  joined = true;
+  me.id = id;
+  me.kit = kit;
+  me.alive = false;
+  startScreen.classList.remove('show');
+});
+
+socket.on('intermission', ({ results, options, votes, secondsLeft }) => {
+  me.alive = false;
+  mouseDown = false;
+  setZoom(false);
+  document.exitPointerLock();
+  deathScreen.classList.remove('show');
+  kitScreen.classList.remove('show');
+  scoreboard.classList.remove('show');
+  pausedBox.classList.remove('show');
+  if (!joined) return; // still on the start screen
+
+  // Title and results table
+  const top = results[0];
+  $('#roundTitle').textContent = top && top.kills > 0 ? `${top.name} wins the round` : 'Round over';
+  const tbody = $('#resultsTable tbody');
+  tbody.innerHTML = '';
+  for (const r of results) {
+    const tr = document.createElement('tr');
+    if (r.rank === 1 && r.kills > 0) tr.classList.add('first');
+    if (r.id === me.id) tr.classList.add('me');
+    for (const value of [r.rank, r.name, KITS[r.kit].name, r.kills, r.deaths]) {
+      const td = document.createElement('td');
+      td.textContent = value;
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+
+  // Vote cards
+  voteOptions = options;
+  myVote = null;
+  const box = $('#voteOptions');
+  box.innerHTML = '';
+  options.forEach((id, i) => {
+    const map = getMap(id);
+    const t = map.theme;
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'vote';
+    card.dataset.map = id;
+    card.setAttribute('aria-pressed', 'false');
+    card.innerHTML = `
+      <span class="swatch"><span></span><span></span><span></span><span></span></span>
+      <span class="body">
+        <span class="top"><span class="map-name"></span><span class="key"></span></span>
+        <span class="tag"></span>
+        <span class="blurb"></span>
+        <span class="bar"><div></div></span>
+        <span class="count">0 votes</span>
+      </span>`;
+    const hex = (n) => '#' + n.toString(16).padStart(6, '0');
+    const colors = [t.sky, t.floor, t.styles.wall.color, t.styles.crate.color];
+    card.querySelectorAll('.swatch span').forEach((el, k) => (el.style.background = hex(colors[k])));
+    card.querySelector('.map-name').textContent = map.name;
+    card.querySelector('.key').textContent = `Press ${i + 1}`;
+    card.querySelector('.tag').textContent = map.tag;
+    card.querySelector('.blurb').textContent = map.blurb;
+    card.addEventListener('click', () => castVote(id));
+    box.appendChild(card);
+  });
+  showVotes(votes);
+
+  // Countdown
+  intermissionScreen.classList.add('show');
+  const endsAt = performance.now() + secondsLeft * 1000;
+  clearInterval(intermissionTimer);
+  const tick = () => {
+    const left = Math.max(0, Math.ceil((endsAt - performance.now()) / 1000));
+    $('#roundSub').textContent = `Next map in ${left}`;
+  };
+  tick();
+  intermissionTimer = setInterval(tick, 250);
+});
+
+function castVote(mapId) {
+  if (!voteOptions.includes(mapId)) return;
+  myVote = mapId;
+  socket.emit('vote', mapId);
+  for (const card of document.querySelectorAll('.vote')) {
+    card.setAttribute('aria-pressed', String(card.dataset.map === mapId));
+  }
+}
+
+function showVotes(votes) {
+  const total = Object.values(votes).reduce((a, b) => a + b, 0);
+  for (const card of document.querySelectorAll('.vote')) {
+    const n = votes[card.dataset.map] || 0;
+    card.querySelector('.count').textContent = `${n} vote${n === 1 ? '' : 's'}`;
+    card.querySelector('.bar div').style.width = total ? `${(n / total) * 100}%` : '0';
+  }
+}
+
+socket.on('votes', showVotes);
 socket.on('feed', addFeed);
 
 setInterval(() => {
@@ -498,6 +690,9 @@ document.addEventListener('mouseup', (e) => {
 document.addEventListener('contextmenu', (e) => e.preventDefault());
 document.addEventListener('keydown', (e) => {
   if (e.code === 'Tab' && joined && me.alive) { e.preventDefault(); scoreboard.classList.add('show'); }
+  if (intermissionScreen.classList.contains('show') && /^Digit[1-4]$/.test(e.code)) {
+    castVote(voteOptions[Number(e.code.slice(5)) - 1]);
+  }
   if (e.code === 'Space' && !e.repeat && joined && me.alive && me.jumpsLeft > 0) {
     me.velY = JUMP_SPEED;
     me.jumpsLeft -= 1;
@@ -528,7 +723,8 @@ function fire() {
   if (!KITS[me.kit].pellets) {
     const start = new THREE.Vector3();
     gun.getWorldPosition(start);
-    drawTracer(start, me.pos.clone().addScaledVector(dir, 60), 0xffffff);
+    const reach = raycastMap(me.pos, dir, 180); // stop the line at the first wall
+    drawTracer(start, me.pos.clone().addScaledVector(dir, reach), 0xffffff);
   }
 
   // Small recoil kick on the gun model
@@ -613,7 +809,7 @@ function frame() {
 
   camera.position.copy(me.pos);
   camera.rotation.set(me.pitch, me.yaw, 0);
-  materials.pad.emissiveIntensity = 0.45 + 0.35 * Math.sin(performance.now() / 250);
+  if (padMaterial) padMaterial.emissiveIntensity = 0.45 + 0.35 * Math.sin(performance.now() / 250);
   gun.visible = me.alive && !zoomed;
 
   // Smoothly move other players toward their latest known position
