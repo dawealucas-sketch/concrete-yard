@@ -8,23 +8,26 @@
 
 import * as THREE from '/three/three.module.js';
 import { WALLS, ARENA_SIZE, EYE_HEIGHT, PLAYER_RADIUS } from './map.js';
+import { KITS, DEFAULT_KIT } from './kits.js';
 
-// ---- Movement settings ----
-const WALK_SPEED = 7;
+// ---- Movement settings (speed, jumps and fire rate come from the kit) ----
 const JUMP_SPEED = 7;
 const GRAVITY = 20;
 const MOUSE_SENSITIVITY = 0.0022;
-const FIRE_INTERVAL_MS = 200; // matches the server cooldown
+const NORMAL_FOV = 75;
+const ZOOM_FOV = 22;
 const SEND_RATE = 20;         // position updates sent per second
 
 // ---- Page elements ----
 const $ = (sel) => document.querySelector(sel);
-const startScreen = $('#start');
+const startScreen = $('#startScreen');
+const deathScreen = $('#deathScreen');
+const kitScreen = $('#kitScreen');
 const healthBox = $('#health');
 const crosshair = $('#crosshair');
+const scopeOverlay = $('#scope');
 const feedBox = $('#feed');
 const scoreboard = $('#scoreboard');
-const deadBox = $('#dead');
 const pausedBox = $('#paused');
 const damageFlash = $('#damage');
 
@@ -39,7 +42,7 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x9fb4c4);
 scene.fog = new THREE.Fog(0x9fb4c4, 30, 90);
 
-const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.05, 200);
+const camera = new THREE.PerspectiveCamera(NORMAL_FOV, window.innerWidth / window.innerHeight, 0.05, 200);
 camera.rotation.order = 'YXZ'; // yaw first, then pitch — standard for FPS cameras
 scene.add(camera);
 
@@ -90,12 +93,17 @@ const me = {
   yaw: 0,
   pitch: 0,
   onGround: true,
+  jumpsLeft: 0,
   alive: false,
+  kit: DEFAULT_KIT,
 };
 const keys = {};
 let mouseDown = false;
+let zoomed = false;
 let lastFire = 0;
 let joined = false;
+let chosenKit = DEFAULT_KIT; // the kit highlighted in the menus
+let healthMax = null;        // used to redraw the segment marks when it changes
 
 // ---- Other players ----
 const others = {}; // id -> { group, target, yaw, label }
@@ -134,19 +142,21 @@ function makeHealthBar() {
   return { sprite, canvas, texture, value: null };
 }
 
-function drawHealthBar(bar, health) {
-  if (bar.value === health) return; // only redraw when it changes
-  bar.value = health;
+function drawHealthBar(bar, health, maxHealth) {
+  const key = `${health}/${maxHealth}`;
+  if (bar.value === key) return; // only redraw when it changes
+  bar.value = key;
+  const fraction = Math.max(0, health) / maxHealth;
   const ctx = bar.canvas.getContext('2d');
   const { width, height } = bar.canvas;
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = 'rgba(43,46,51,0.8)';
   ctx.fillRect(0, 0, width, height);
-  ctx.fillStyle = health > 50 ? '#f2efe8' : health > 25 ? '#e8a33d' : '#c8463c';
-  ctx.fillRect(2, 2, (width - 4) * Math.max(0, health) / 100, height - 4);
+  ctx.fillStyle = fraction > 0.5 ? '#f2efe8' : fraction > 0.25 ? '#e8a33d' : '#c8463c';
+  ctx.fillRect(2, 2, (width - 4) * fraction, height - 4);
   // Segment marks every 25 health
   ctx.fillStyle = 'rgba(43,46,51,0.9)';
-  for (let i = 1; i < 4; i++) ctx.fillRect(Math.round(width * i / 4) - 1, 0, 2, height);
+  for (let hp = 25; hp < maxHealth; hp += 25) ctx.fillRect(Math.round(width * hp / maxHealth) - 1, 0, 2, height);
   bar.texture.needsUpdate = true;
 }
 
@@ -172,7 +182,7 @@ function createOther(p) {
   const label = makeLabel(p.name);
   group.add(label);
   const healthBar = makeHealthBar();
-  drawHealthBar(healthBar, p.health);
+  drawHealthBar(healthBar, p.health, p.maxHealth);
   group.add(healthBar.sprite);
   scene.add(group);
 
@@ -194,14 +204,55 @@ function drawTracer(from, to, color) {
 }
 
 // ---- HUD helpers ----
-function setHealth(value) {
+function setHealth(value, maxHealth) {
   const v = Math.max(0, value);
+  const percent = (v / maxHealth) * 100;
   healthBox.querySelector('.value').textContent = v;
-  healthBox.querySelector('.fill').style.width = `${v}%`;
-  healthBox.querySelector('.trail').style.width = `${v}%`; // lags behind to show damage taken
-  healthBox.classList.toggle('mid', v > 25 && v <= 50);
-  healthBox.classList.toggle('low', v <= 25);
+  healthBox.querySelector('.fill').style.width = `${percent}%`;
+  healthBox.querySelector('.trail').style.width = `${percent}%`; // lags behind to show damage taken
+  healthBox.classList.toggle('mid', percent > 25 && percent <= 50);
+  healthBox.classList.toggle('low', percent <= 25);
+
+  // One segment per 25 health, so a 150-health Tank shows six segments
+  if (healthMax !== maxHealth) {
+    healthMax = maxHealth;
+    const ticks = healthBox.querySelector('.ticks');
+    ticks.innerHTML = '';
+    for (let hp = 25; hp < maxHealth; hp += 25) {
+      const mark = document.createElement('span');
+      mark.style.left = `${(hp / maxHealth) * 100}%`;
+      ticks.appendChild(mark);
+    }
+  }
 }
+
+// ---- Kit menus ----
+function buildKitPicker(container, onChange) {
+  for (const [id, kit] of Object.entries(KITS)) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'kit';
+    button.dataset.kit = id;
+    button.innerHTML = '<span class="kit-name"></span><span class="plus"></span><span class="minus"></span>';
+    button.querySelector('.kit-name').textContent = kit.name;
+    button.querySelector('.plus').textContent = kit.strength;
+    button.querySelector('.minus').textContent = kit.weakness;
+    button.addEventListener('click', () => onChange(id));
+    container.appendChild(button);
+  }
+}
+
+function selectKit(id) {
+  chosenKit = id;
+  for (const button of document.querySelectorAll('.kit')) {
+    button.setAttribute('aria-pressed', String(button.dataset.kit === id));
+  }
+  $('#respawnButton').textContent = `Respawn as ${KITS[id].name}`;
+}
+
+buildKitPicker($('#startKits'), selectKit);
+buildKitPicker($('#respawnKits'), selectKit);
+selectKit(DEFAULT_KIT);
 
 function addFeed(text) {
   const item = document.createElement('div');
@@ -218,7 +269,7 @@ function updateScoreboard(state) {
   for (const p of rows) {
     const tr = document.createElement('tr');
     if (p.id === me.id) tr.className = 'me';
-    for (const value of [p.name, p.kills, p.deaths]) {
+    for (const value of [p.name, KITS[p.kit].name, p.kills, p.deaths]) {
       const td = document.createElement('td');
       td.textContent = value;
       tr.appendChild(td);
@@ -233,17 +284,36 @@ const socket = io();
 $('#joinForm').addEventListener('submit', (e) => {
   e.preventDefault();
   if (joined) return;
-  socket.emit('join', $('#name').value);
+  socket.emit('join', { name: $('#name').value, kit: chosenKit });
 });
 
-socket.on('welcome', ({ id, spawn }) => {
+// Sent when we first join and every time we respawn
+socket.on('spawned', ({ id, x, y, z, kit }) => {
   joined = true;
   me.id = id;
   me.alive = true;
-  me.pos.set(spawn.x, spawn.y, spawn.z);
-  startScreen.style.display = 'none';
-  renderer.domElement.requestPointerLock();
+  me.kit = kit;
+  me.pos.set(x, y, z);
+  me.velY = 0;
+  me.jumpsLeft = KITS[kit].jumps;
+  healthBox.querySelector('.kit-label').textContent = KITS[kit].name;
+  setHealth(KITS[kit].maxHealth, KITS[kit].maxHealth);
+  setZoom(false);
+  startScreen.classList.remove('show');
+  deathScreen.classList.remove('show');
+  kitScreen.classList.remove('show');
+  lockMouse();
 });
+
+// Capture the mouse for aiming. If the browser refuses (it sometimes does
+// right after a menu), show "Click to resume" so one click fixes it.
+function lockMouse() {
+  try {
+    const request = renderer.domElement.requestPointerLock();
+    if (request && request.catch) request.catch(() => {});
+  } catch (err) { /* handled by the message below */ }
+  pausedBox.classList.toggle('show', !isLocked());
+}
 
 socket.on('full', () => {
   $('#error').textContent = 'This match has 20 players. Try again when someone leaves.';
@@ -257,13 +327,16 @@ socket.on('state', (state) => {
   const seen = new Set();
   for (const p of state) {
     seen.add(p.id);
-    if (p.id === me.id) continue;
+    if (p.id === me.id) {
+      if (me.alive) setHealth(p.health, p.maxHealth);
+      continue;
+    }
     if (!others[p.id]) others[p.id] = createOther(p);
     const o = others[p.id];
     o.target.set(p.x, p.y - EYE_HEIGHT, p.z);
     o.yaw = p.yaw;
     o.group.visible = p.alive;
-    drawHealthBar(o.healthBar, p.health);
+    drawHealthBar(o.healthBar, p.health, p.maxHealth);
   }
   // Remove players who left
   for (const id of Object.keys(others)) {
@@ -275,9 +348,15 @@ socket.on('state', (state) => {
   updateScoreboard(state);
 });
 
-socket.on('shot', ({ from, origin, end }) => {
-  if (from === me.id) return; // our own tracer is drawn instantly when we fire
-  drawTracer(new THREE.Vector3(origin.x, origin.y - 0.3, origin.z), new THREE.Vector3(end.x, end.y, end.z), 0xffd27a);
+socket.on('shot', ({ from, origin, ends }) => {
+  // Our own single-bullet shots are drawn instantly when we fire.
+  // Shotgun pellets are drawn from here, because the server picks their spread.
+  if (from === me.id && ends.length === 1) return;
+  const start = new THREE.Vector3(origin.x, origin.y - 0.3, origin.z);
+  if (from === me.id) gun.getWorldPosition(start);
+  for (const end of ends) {
+    drawTracer(start, new THREE.Vector3(end.x, end.y, end.z), from === me.id ? 0xffffff : 0xffd27a);
+  }
 });
 
 socket.on('hitmarker', ({ headshot }) => {
@@ -285,25 +364,52 @@ socket.on('hitmarker', ({ headshot }) => {
   setTimeout(() => (crosshair.className = ''), 150);
 });
 
-socket.on('hurt', ({ health }) => {
-  setHealth(health);
+socket.on('hurt', () => {
   damageFlash.style.opacity = 1;
   setTimeout(() => (damageFlash.style.opacity = 0), 150);
 });
 
-socket.on('died', ({ by }) => {
+socket.on('died', ({ by, byKit, waitMs }) => {
   me.alive = false;
-  $('#deadText').textContent = `Eliminated by ${by}. Respawning…`;
-  deadBox.classList.add('show');
+  mouseDown = false;
+  setZoom(false);
+  document.exitPointerLock();
+  selectKit(me.kit);
+
+  $('#deathTitle').textContent = `Eliminated by ${by} (${byKit})`;
+  const continueButton = $('#continueButton');
+  const changeButton = $('#changeKitButton');
+  continueButton.textContent = `Continue as ${KITS[me.kit].name}`;
+  continueButton.disabled = true;
+  changeButton.disabled = true;
+  deathScreen.classList.add('show');
+
+  // Count down until the server allows a respawn
+  const readyAt = performance.now() + waitMs;
+  const timer = setInterval(() => {
+    const left = Math.ceil((readyAt - performance.now()) / 1000);
+    if (left > 0) {
+      $('#deathTimer').textContent = `Respawn available in ${left}`;
+    } else {
+      clearInterval(timer);
+      $('#deathTimer').textContent = 'Keep your kit or pick a new one.';
+      continueButton.disabled = false;
+      changeButton.disabled = false;
+      continueButton.focus();
+    }
+  }, 100);
 });
 
-socket.on('respawn', ({ x, y, z }) => {
-  me.alive = true;
-  me.pos.set(x, y, z);
-  me.velY = 0;
-  setHealth(100);
-  deadBox.classList.remove('show');
+$('#continueButton').addEventListener('click', () => socket.emit('respawn', me.kit));
+$('#changeKitButton').addEventListener('click', () => {
+  deathScreen.classList.remove('show');
+  kitScreen.classList.add('show');
 });
+$('#backButton').addEventListener('click', () => {
+  kitScreen.classList.remove('show');
+  deathScreen.classList.add('show');
+});
+$('#respawnButton').addEventListener('click', () => socket.emit('respawn', chosenKit));
 
 socket.on('correct', ({ x, y, z }) => me.pos.set(x, y, z));
 socket.on('feed', addFeed);
@@ -317,21 +423,41 @@ setInterval(() => {
 const isLocked = () => document.pointerLockElement === renderer.domElement;
 
 renderer.domElement.addEventListener('click', () => {
-  if (joined && !isLocked()) renderer.domElement.requestPointerLock();
+  if (joined && me.alive && !isLocked()) lockMouse();
 });
 document.addEventListener('pointerlockchange', () => {
-  pausedBox.classList.toggle('show', joined && !isLocked());
+  pausedBox.classList.toggle('show', joined && me.alive && !isLocked());
 });
+function setZoom(on) {
+  zoomed = on;
+  camera.fov = on ? ZOOM_FOV : NORMAL_FOV;
+  camera.updateProjectionMatrix();
+  scopeOverlay.classList.toggle('show', on);
+}
+
 document.addEventListener('mousemove', (e) => {
   if (!isLocked()) return;
-  me.yaw -= e.movementX * MOUSE_SENSITIVITY;
-  me.pitch -= e.movementY * MOUSE_SENSITIVITY;
+  const sensitivity = MOUSE_SENSITIVITY * (zoomed ? ZOOM_FOV / NORMAL_FOV : 1);
+  me.yaw -= e.movementX * sensitivity;
+  me.pitch -= e.movementY * sensitivity;
   me.pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, me.pitch));
 });
-document.addEventListener('mousedown', (e) => { if (e.button === 0) mouseDown = true; });
-document.addEventListener('mouseup', (e) => { if (e.button === 0) mouseDown = false; });
+document.addEventListener('mousedown', (e) => {
+  if (e.button === 0) mouseDown = true;
+  if (e.button === 2 && isLocked() && me.alive && KITS[me.kit].zoom) setZoom(true);
+});
+document.addEventListener('mouseup', (e) => {
+  if (e.button === 0) mouseDown = false;
+  if (e.button === 2) setZoom(false);
+});
+document.addEventListener('contextmenu', (e) => e.preventDefault());
 document.addEventListener('keydown', (e) => {
-  if (e.code === 'Tab') { e.preventDefault(); scoreboard.classList.add('show'); }
+  if (e.code === 'Tab' && joined && me.alive) { e.preventDefault(); scoreboard.classList.add('show'); }
+  if (e.code === 'Space' && !e.repeat && joined && me.alive && me.jumpsLeft > 0) {
+    me.velY = JUMP_SPEED;
+    me.jumpsLeft -= 1;
+    me.onGround = false;
+  }
   keys[e.code] = true;
 });
 document.addEventListener('keyup', (e) => {
@@ -346,17 +472,19 @@ window.addEventListener('resize', () => {
 
 function fire() {
   const now = performance.now();
-  if (now - lastFire < FIRE_INTERVAL_MS) return;
+  if (now - lastFire < KITS[me.kit].fireMs) return;
   lastFire = now;
 
   const dir = new THREE.Vector3();
   camera.getWorldDirection(dir);
   socket.emit('shoot', { x: dir.x, y: dir.y, z: dir.z });
 
-  // Draw our tracer right away so shooting feels responsive
-  const start = new THREE.Vector3();
-  gun.getWorldPosition(start);
-  drawTracer(start, me.pos.clone().addScaledVector(dir, 60), 0xffffff);
+  // Draw our tracer right away so shooting feels responsive (shotgun waits for the server)
+  if (!KITS[me.kit].pellets) {
+    const start = new THREE.Vector3();
+    gun.getWorldPosition(start);
+    drawTracer(start, me.pos.clone().addScaledVector(dir, 60), 0xffffff);
+  }
 
   // Small recoil kick on the gun model
   gun.position.z = -0.38;
@@ -400,8 +528,9 @@ function updateMovement(dt) {
     mx = strafe * cos - forward * sin;
     mz = -strafe * sin - forward * cos;
     const len = Math.hypot(mx, mz);
-    mx = (mx / len) * WALK_SPEED * dt;
-    mz = (mz / len) * WALK_SPEED * dt;
+    const speed = KITS[me.kit].speed;
+    mx = (mx / len) * speed * dt;
+    mz = (mz / len) * speed * dt;
   }
 
   // Move one axis at a time so we slide along walls instead of sticking
@@ -409,8 +538,7 @@ function updateMovement(dt) {
   if (!blocked(me.pos.x + mx, me.pos.z, feet)) me.pos.x += mx;
   if (!blocked(me.pos.x, me.pos.z + mz, feet)) me.pos.z += mz;
 
-  // Jumping and gravity
-  if (keys.Space && me.onGround) { me.velY = JUMP_SPEED; me.onGround = false; }
+  // Gravity (jumping is handled in the keydown listener)
   me.velY -= GRAVITY * dt;
   me.pos.y += me.velY * dt;
 
@@ -419,8 +547,10 @@ function updateMovement(dt) {
     me.pos.y = ground;
     me.velY = 0;
     me.onGround = true;
-  } else {
+    me.jumpsLeft = KITS[me.kit].jumps;
+  } else if (me.onGround) {
     me.onGround = false;
+    me.jumpsLeft = Math.max(0, KITS[me.kit].jumps - 1);
   }
 }
 
@@ -436,7 +566,7 @@ function frame() {
 
   camera.position.copy(me.pos);
   camera.rotation.set(me.pitch, me.yaw, 0);
-  gun.visible = me.alive;
+  gun.visible = me.alive && !zoomed;
 
   // Smoothly move other players toward their latest known position
   const smoothing = 1 - Math.exp(-15 * dt);
