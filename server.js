@@ -11,7 +11,7 @@ import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Server } from 'socket.io';
-import { WALLS, SPAWN_POINTS, ARENA_SIZE, EYE_HEIGHT } from './public/map.js';
+import { SPAWN_POINTS, ARENA_SIZE, EYE_HEIGHT, raycastMap } from './public/map.js';
 import { KITS, DEFAULT_KIT } from './public/kits.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -76,30 +76,9 @@ function rayHitsSphere(origin, dir, center, radius) {
   return t > 0 ? t : Infinity;
 }
 
-// Returns the distance along the ray to a wall box, or Infinity on a miss.
-function rayHitsWall(origin, dir, wall) {
-  const min = { x: wall.x - wall.w / 2, y: 0, z: wall.z - wall.d / 2 };
-  const max = { x: wall.x + wall.w / 2, y: wall.h, z: wall.z + wall.d / 2 };
-  let tMin = 0, tMax = Infinity;
-  for (const axis of ['x', 'y', 'z']) {
-    if (Math.abs(dir[axis]) < 1e-8) {
-      if (origin[axis] < min[axis] || origin[axis] > max[axis]) return Infinity;
-    } else {
-      let t1 = (min[axis] - origin[axis]) / dir[axis];
-      let t2 = (max[axis] - origin[axis]) / dir[axis];
-      if (t1 > t2) [t1, t2] = [t2, t1];
-      tMin = Math.max(tMin, t1);
-      tMax = Math.min(tMax, t2);
-      if (tMin > tMax) return Infinity;
-    }
-  }
-  return tMin;
-}
-
 // Follows one bullet and reports the first player it hits (if any) before a wall.
 function traceShot(origin, dir, shooterId) {
-  let distance = SHOT_RANGE;
-  for (const wall of WALLS) distance = Math.min(distance, rayHitsWall(origin, dir, wall));
+  let distance = raycastMap(origin, dir, SHOT_RANGE); // nearest wall, pillar, ramp or bridge
 
   let target = null, headshot = false;
   for (const other of Object.values(players)) {
@@ -208,7 +187,7 @@ io.on('connection', (socket) => {
     const limit = ARENA_SIZE / 2;
     p.x = Math.max(-limit, Math.min(limit, data.x));
     p.z = Math.max(-limit, Math.min(limit, data.z));
-    p.y = Math.max(EYE_HEIGHT, Math.min(10, Number(data.y) || EYE_HEIGHT));
+    p.y = Math.max(EYE_HEIGHT, Math.min(40, Number(data.y) || EYE_HEIGHT)); // jump pads go high
     p.yaw = Number(data.yaw) || 0;
     p.pitch = Number(data.pitch) || 0;
     p.lastMove = now;
