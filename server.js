@@ -2,7 +2,7 @@
 //
 // What the server does:
 //   1. Serves the web page (the files in /public) to each player's browser.
-//   2. Keeps the list of players and their health, kills and deaths.
+//   2. Keeps the list of players: kit, health, kills and deaths.
 //   3. Decides whether shots hit (so players can't simply claim a kill).
 //   4. Sends everyone's positions to everyone else 20 times per second.
 
@@ -12,20 +12,18 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { Server } from 'socket.io';
 import { WALLS, SPAWN_POINTS, ARENA_SIZE, EYE_HEIGHT } from './public/map.js';
+import { KITS, DEFAULT_KIT } from './public/kits.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3000;
 
-// ---- Game settings (change these to tune the game) ----
+// ---- Game settings (kit-specific numbers are in public/kits.js) ----
 const MAX_PLAYERS = 20;
 const TICK_RATE = 20;          // position updates sent per second
-const MAX_HEALTH = 100;
-const BODY_DAMAGE = 25;
-const HEAD_DAMAGE = 50;
-const FIRE_COOLDOWN_MS = 200;  // minimum time between shots
-const RESPAWN_MS = 3000;
+const RESPAWN_MS = 3000;       // minimum time on the death screen
 const SHOT_RANGE = 100;
 const MAX_SPEED = 12;          // units per second; faster movement is rejected
+const FIRE_TOLERANCE_MS = 30;  // allows for small network timing differences
 
 const app = express();
 const server = http.createServer(app);
@@ -46,6 +44,23 @@ function randomSpawn() {
 function cleanName(name) {
   const text = String(name || '').replace(/[^\w \-]/g, '').trim().slice(0, 16);
   return text || 'Player';
+}
+
+function validKit(kitId) {
+  return Object.hasOwn(KITS, kitId) ? kitId : DEFAULT_KIT;
+}
+
+// Put a player back into the game with the given kit
+function spawnPlayer(p, kitId) {
+  p.kit = validKit(kitId);
+  const kit = KITS[p.kit];
+  Object.assign(p, randomSpawn(), {
+    maxHealth: kit.maxHealth,
+    health: kit.maxHealth,
+    alive: true,
+    lastMove: Date.now(),
+    lastDamaged: 0,
+  });
 }
 
 // ---- Ray tests used for hit detection ----
@@ -81,10 +96,70 @@ function rayHitsWall(origin, dir, wall) {
   return tMin;
 }
 
+// Follows one bullet and reports the first player it hits (if any) before a wall.
+function traceShot(origin, dir, shooterId) {
+  let distance = SHOT_RANGE;
+  for (const wall of WALLS) distance = Math.min(distance, rayHitsWall(origin, dir, wall));
+
+  let target = null, headshot = false;
+  for (const other of Object.values(players)) {
+    if (other.id === shooterId || !other.alive) continue;
+    const headDist = rayHitsSphere(origin, dir, { x: other.x, y: other.y, z: other.z }, 0.3);
+    const bodyDist = rayHitsSphere(origin, dir, { x: other.x, y: other.y - 0.75, z: other.z }, 0.75);
+    if (headDist < distance) { target = other; distance = headDist; headshot = true; }
+    if (bodyDist < distance) { target = other; distance = bodyDist; headshot = false; }
+  }
+
+  const end = {
+    x: origin.x + dir.x * distance,
+    y: origin.y + dir.y * distance,
+    z: origin.z + dir.z * distance,
+  };
+  return { target, headshot, end };
+}
+
+// Tilts a direction randomly inside a cone (used for shotgun pellets).
+function spreadDirection(dir, angle) {
+  // Two directions at right angles to dir
+  const up = Math.abs(dir.y) < 0.99 ? { x: 0, y: 1, z: 0 } : { x: 1, y: 0, z: 0 };
+  let rx = up.y * dir.z - up.z * dir.y, ry = up.z * dir.x - up.x * dir.z, rz = up.x * dir.y - up.y * dir.x;
+  const rl = Math.hypot(rx, ry, rz); rx /= rl; ry /= rl; rz /= rl;
+  const ux = dir.y * rz - dir.z * ry, uy = dir.z * rx - dir.x * rz, uz = dir.x * ry - dir.y * rx;
+
+  const r = Math.tan(angle) * Math.sqrt(Math.random());
+  const a = Math.random() * Math.PI * 2;
+  const ox = Math.cos(a) * r, oy = Math.sin(a) * r;
+  const x = dir.x + rx * ox + ux * oy, y = dir.y + ry * ox + uy * oy, z = dir.z + rz * ox + uz * oy;
+  const len = Math.hypot(x, y, z);
+  return { x: x / len, y: y / len, z: z / len };
+}
+
+function applyHit(shooter, target, headshot) {
+  if (!target.alive) return;
+  const kit = KITS[shooter.kit];
+  target.health -= headshot ? kit.headDamage : kit.damage;
+  target.lastDamaged = Date.now();
+  io.to(target.id).emit('hurt');
+
+  if (kit.lifesteal && shooter.alive) {
+    shooter.health = Math.min(shooter.maxHealth, shooter.health + kit.lifesteal);
+  }
+
+  if (target.health <= 0) {
+    target.alive = false;
+    target.health = 0;
+    target.deaths += 1;
+    target.canRespawnAt = Date.now() + RESPAWN_MS;
+    shooter.kills += 1;
+    io.emit('feed', `${shooter.name} eliminated ${target.name}${headshot ? ' (headshot)' : ''}`);
+    io.to(target.id).emit('died', { by: shooter.name, byKit: KITS[shooter.kit].name, waitMs: RESPAWN_MS });
+  }
+}
+
 // ---- Connections ----
 
 io.on('connection', (socket) => {
-  socket.on('join', (name) => {
+  socket.on('join', (data) => {
     if (players[socket.id]) return;
     if (Object.keys(players).length >= MAX_PLAYERS) {
       socket.emit('full');
@@ -92,23 +167,26 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const spawn = randomSpawn();
-    players[socket.id] = {
+    const p = {
       id: socket.id,
-      name: cleanName(name),
-      ...spawn,
-      yaw: 0,
-      pitch: 0,
-      health: MAX_HEALTH,
-      alive: true,
-      kills: 0,
-      deaths: 0,
+      name: cleanName(data && data.name),
+      yaw: 0, pitch: 0,
+      kills: 0, deaths: 0,
       lastShot: 0,
-      lastMove: Date.now(),
     };
+    spawnPlayer(p, data && data.kit);
+    players[socket.id] = p;
 
-    socket.emit('welcome', { id: socket.id, spawn });
-    io.emit('feed', `${players[socket.id].name} joined`);
+    socket.emit('spawned', { x: p.x, y: p.y, z: p.z, kit: p.kit, id: socket.id });
+    io.emit('feed', `${p.name} joined as ${KITS[p.kit].name}`);
+  });
+
+  // From the death screen: "Continue" sends the same kit, "Change kit" sends a new one
+  socket.on('respawn', (kitId) => {
+    const p = players[socket.id];
+    if (!p || p.alive || Date.now() < p.canRespawnAt) return;
+    spawnPlayer(p, kitId);
+    socket.emit('spawned', { x: p.x, y: p.y, z: p.z, kit: p.kit, id: socket.id });
   });
 
   // The browser reports where its player is. The server checks it is believable.
@@ -140,59 +218,34 @@ io.on('connection', (socket) => {
   socket.on('shoot', (dirIn) => {
     const shooter = players[socket.id];
     if (!shooter || !shooter.alive || !dirIn) return;
+    const kit = KITS[shooter.kit];
 
     const now = Date.now();
-    if (now - shooter.lastShot < FIRE_COOLDOWN_MS) return;
+    if (now - shooter.lastShot < kit.fireMs - FIRE_TOLERANCE_MS) return;
     shooter.lastShot = now;
 
     const len = Math.hypot(dirIn.x, dirIn.y, dirIn.z);
     if (!Number.isFinite(len) || len === 0) return;
-    const dir = { x: dirIn.x / len, y: dirIn.y / len, z: dirIn.z / len };
+    const aim = { x: dirIn.x / len, y: dirIn.y / len, z: dirIn.z / len };
     const origin = { x: shooter.x, y: shooter.y, z: shooter.z };
 
-    // Nearest wall in the line of fire
-    let wallDist = SHOT_RANGE;
-    for (const wall of WALLS) wallDist = Math.min(wallDist, rayHitsWall(origin, dir, wall));
+    const pellets = kit.pellets || 1;
+    const ends = [];
+    let anyHit = false, anyHead = false;
 
-    // Nearest player in front of that wall
-    let target = null, targetDist = wallDist, headshot = false;
-    for (const other of Object.values(players)) {
-      if (other.id === shooter.id || !other.alive) continue;
-      const head = { x: other.x, y: other.y, z: other.z };
-      const body = { x: other.x, y: other.y - 0.75, z: other.z };
-      const headDist = rayHitsSphere(origin, dir, head, 0.3);
-      const bodyDist = rayHitsSphere(origin, dir, body, 0.75);
-      if (headDist < targetDist) { target = other; targetDist = headDist; headshot = true; }
-      if (bodyDist < targetDist) { target = other; targetDist = bodyDist; headshot = false; }
+    for (let i = 0; i < pellets; i++) {
+      const dir = pellets > 1 ? spreadDirection(aim, kit.spread) : aim;
+      const { target, headshot, end } = traceShot(origin, dir, shooter.id);
+      ends.push(end);
+      if (target) {
+        anyHit = true;
+        anyHead = anyHead || headshot;
+        applyHit(shooter, target, headshot);
+      }
     }
 
-    const end = {
-      x: origin.x + dir.x * targetDist,
-      y: origin.y + dir.y * targetDist,
-      z: origin.z + dir.z * targetDist,
-    };
-    io.emit('shot', { from: shooter.id, origin, end });
-
-    if (!target) return;
-
-    target.health -= headshot ? HEAD_DAMAGE : BODY_DAMAGE;
-    io.to(target.id).emit('hurt', { health: target.health });
-    socket.emit('hitmarker', { headshot });
-
-    if (target.health <= 0) {
-      target.alive = false;
-      target.health = 0;
-      target.deaths += 1;
-      shooter.kills += 1;
-      io.emit('feed', `${shooter.name} eliminated ${target.name}${headshot ? ' (headshot)' : ''}`);
-      io.to(target.id).emit('died', { by: shooter.name });
-
-      setTimeout(() => {
-        if (!players[target.id]) return; // they left while dead
-        Object.assign(target, randomSpawn(), { health: MAX_HEALTH, alive: true, lastMove: Date.now() });
-        io.to(target.id).emit('respawn', { x: target.x, y: target.y, z: target.z });
-      }, RESPAWN_MS);
-    }
+    io.emit('shot', { from: shooter.id, origin, ends });
+    if (anyHit) socket.emit('hitmarker', { headshot: anyHead });
   });
 
   socket.on('disconnect', () => {
@@ -203,12 +256,21 @@ io.on('connection', (socket) => {
   });
 });
 
-// ---- Send everyone the current state, TICK_RATE times per second ----
+// ---- Every tick: Medic healing, then send everyone the current state ----
 setInterval(() => {
+  const now = Date.now();
+  for (const p of Object.values(players)) {
+    const regen = KITS[p.kit].regen;
+    if (regen && p.alive && p.health < p.maxHealth && now - p.lastDamaged >= regen.delayMs) {
+      p.health = Math.min(p.maxHealth, p.health + regen.perSecond / TICK_RATE);
+    }
+  }
+
   const state = Object.values(players).map((p) => ({
-    id: p.id, name: p.name,
+    id: p.id, name: p.name, kit: p.kit,
     x: p.x, y: p.y, z: p.z, yaw: p.yaw, pitch: p.pitch,
-    health: p.health, alive: p.alive, kills: p.kills, deaths: p.deaths,
+    health: Math.ceil(p.health), maxHealth: p.maxHealth,
+    alive: p.alive, kills: p.kills, deaths: p.deaths,
   }));
   io.emit('state', state);
 }, 1000 / TICK_RATE);
