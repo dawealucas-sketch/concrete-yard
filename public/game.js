@@ -679,13 +679,22 @@ document.addEventListener('mousemove', (e) => {
   me.pitch -= e.movementY * sensitivity;
   me.pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, me.pitch));
 });
+// Sniper zoom: press Q to zoom in or out. Right click works too:
+// hold it to zoom while held, or tap it (like a touchpad tap) to switch zoom on or off.
+let zoomPressedAt = 0;
+let ignoreZoomRelease = false;
+const canZoom = () => joined && me.alive && KITS[me.kit].zoom && !intermissionScreen.classList.contains('show');
+
 document.addEventListener('mousedown', (e) => {
   if (e.button === 0) mouseDown = true;
-  if (e.button === 2 && isLocked() && me.alive && KITS[me.kit].zoom) setZoom(true);
+  if (e.button === 2 && isLocked() && canZoom()) {
+    if (zoomed) { setZoom(false); ignoreZoomRelease = true; }
+    else { setZoom(true); zoomPressedAt = performance.now(); ignoreZoomRelease = false; }
+  }
 });
 document.addEventListener('mouseup', (e) => {
   if (e.button === 0) mouseDown = false;
-  if (e.button === 2) setZoom(false);
+  if (e.button === 2 && zoomed && !ignoreZoomRelease && performance.now() - zoomPressedAt > 250) setZoom(false);
 });
 document.addEventListener('contextmenu', (e) => e.preventDefault());
 document.addEventListener('keydown', (e) => {
@@ -693,6 +702,7 @@ document.addEventListener('keydown', (e) => {
   if (intermissionScreen.classList.contains('show') && /^Digit[1-4]$/.test(e.code)) {
     castVote(voteOptions[Number(e.code.slice(5)) - 1]);
   }
+  if (e.code === 'KeyQ' && !e.repeat && canZoom()) setZoom(!zoomed);
   if (e.code === 'Space' && !e.repeat && joined && me.alive && me.jumpsLeft > 0) {
     me.velY = JUMP_SPEED;
     me.jumpsLeft -= 1;

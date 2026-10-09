@@ -36,7 +36,7 @@ export const KITS = {
   },
   sniper: {
     name: 'Sniper',
-    strength: 'Right-click to zoom. 50 damage, headshots kill instantly',
+    strength: 'Press Q to zoom. 50 damage, headshots kill instantly',
     weakness: 'Fires once per second',
     maxHealth: 100, speed: 7, jumps: 1,
     damage: 50, headDamage: 1000, fireMs: 1000,
